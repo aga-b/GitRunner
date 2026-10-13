@@ -1,0 +1,13 @@
+.env
+secrets
+state
+tests
+proposed-workflows
+__pycache__
+*.pyc
+*.tar.gz
+.git
+*.zip
+docs
+README.md
+VALIDATION.md

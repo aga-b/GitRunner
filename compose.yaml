@@ -1,0 +1,34 @@
+name: personal-ci
+services:
+  controller:
+    build:
+      context: .
+      dockerfile: controller/Dockerfile
+    image: personal-ci-controller:local
+    restart: unless-stopped
+    init: true
+    env_file: .env
+    environment:
+      STATE_DIR: /state
+      GITHUB_APP_KEY_FILE: /run/secrets/github-app.pem
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - ./secrets:/run/secrets:ro
+      - ./state:/state
+    mem_limit: 256m
+    cpus: 0.5
+    pids_limit: 128
+    read_only: true
+    tmpfs:
+      - /tmp:size=32m
+    logging:
+      driver: json-file
+      options:
+        max-size: 10m
+        max-file: '3'
+    healthcheck:
+      test: [CMD, python, -c, "import time,pathlib; p=pathlib.Path('/state/heartbeat'); assert p.exists() and time.time()-p.stat().st_mtime < 180"]
+      interval: 30s
+      timeout: 5s
+      start_period: 180s
+      retries: 5
