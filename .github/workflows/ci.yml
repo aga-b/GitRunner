@@ -20,7 +20,10 @@ jobs:
       - name: Tests and syntax checks
         run: ./scripts/check.sh
       - name: Validate Compose configuration
-        run: docker compose --env-file .env.example config --quiet
+        run: |
+          cp .env.example .env
+          trap 'rm -f .env' EXIT
+          docker compose config --quiet
       - name: Ensure no secret material is tracked
         run: |
           test ! -e .env

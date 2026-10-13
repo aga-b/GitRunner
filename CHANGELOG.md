@@ -17,3 +17,5 @@
 - Runner Dockerfile legacy Docker builder ile de build edilebiliyor.
 - GitHub API, restart ve kesinti regresyonlarıyla toplam 34 test bulunuyor.
 - Yerel doğrulama ve GitHub Actions aynı scripts/check.sh komutunu kullanıyor.
+- CI Compose kontrolü secrets içermeyen örnek ayarlardan geçici .env oluşturuyor;
+  temiz checkout kurulumu ayrıca doğrulandı.

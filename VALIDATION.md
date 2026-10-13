@@ -9,6 +9,7 @@ ortamında yapılan kontrolleri gösterir. Önceki sunucu deneyimi
 | Python davranış ve regresyon testleri | 34/34 geçti |
 | Python compileall ve bütün shell scriptleri için bash -n | Geçti |
 | Compose config (.env.example ve yerel build ayarları) | Geçti |
+| Temiz git clone üzerinde CI adımları | 34 test ve geçici .env ile Compose kontrolü geçti; geçici dosya silindi |
 | Runner Docker image build | Geçti; Ubuntu 24.04, legacy Docker builder ile de doğrulandı |
 | Controller Docker image build | Geçti |
 | Docker-in-Docker başlangıcı | Gerçek disposable daemon ile geçti |
