@@ -4,7 +4,7 @@ GitHub Actions için kişisel hesaplara yönelik Docker runner autoscaler.
 
 Bu paket `aga-b` hesabının erişime açtığı repoları keşfeder ve kuyruğa göre
 geçici Linux x64 GitHub Actions runner'ları oluşturur. Mevcut `gitrunner`
-sunucusu için başlangıç limiti **2 eşzamanlı iş**; `MAX_RUNNERS` ile
+sunucusu için varsayılan limit **20 eşzamanlı iş** (sunucu 32 çekirdek/64 GB; bellek tabanlı kabul kontrolü uygulanır); `MAX_RUNNERS` ile
 değiştirilebilir. Sınır bütün repoların ortak
 sınırıdır. Kuyruk boşken runner veya Docker sidecar çalışmaz; controller açık kalır.
 
@@ -151,7 +151,7 @@ Controller `state/status.json` ve logları üzerinden izlenebilir. Runner'ların
 bir anda listede görünmesi ya da belirli sırayla iş alması garanti değildir;
 asıl ölçüt başarılı işler ve sonrasında sıfır aktif runner'dır.
 
-Sonra aynı test iki repodan eşzamanlı çalıştırılır: toplamda en fazla `MAX_RUNNERS` (varsayılan 2) iş çalışır,
+Sonra aynı test iki repodan eşzamanlı çalıştırılır: toplamda en fazla `MAX_RUNNERS` (varsayılan 20) iş çalışır,
 kalanlar GitHub kuyruğunda bekler. Bir controller restart testi de yapılır:
 `docker compose restart controller`; çalışan işler devam etmelidir.
 

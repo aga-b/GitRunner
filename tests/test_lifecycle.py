@@ -38,6 +38,7 @@ class LifecycleTests(unittest.TestCase):
         self.env.start()
         self.api,self.docker=FakeAPI(),FakeDocker()
         self.scaler=Scaler(self.api,self.docker)
+        self.scaler.memory_available_mb=lambda: 10**6
 
     def tearDown(self): self.env.stop(); self.tmp.cleanup()
 
@@ -75,6 +76,7 @@ class LifecycleTests(unittest.TestCase):
         with patch.object(self.scaler,'provision') as provision:
             self.scaler.tick()
             provision.assert_not_called()
+        self.scaler.wait_retired()
         self.assertIn(slot,self.docker.removed)
         self.assertTrue(json.loads((self.scaler.state/'status.json').read_text())['errors'])
 
@@ -84,6 +86,7 @@ class LifecycleTests(unittest.TestCase):
         def limited(*a,**k): raise APIError(429,'/actions/runners',retry_after=3600)
         self.api.pages=limited
         self.scaler.tick()
+        self.scaler.wait_retired()
         self.assertIn(slot,self.docker.removed)
         self.assertGreater(self.scaler.cooldown['aga-b/demo'],time.time()+3500)
 
@@ -161,6 +164,74 @@ class LifecycleTests(unittest.TestCase):
             self.scaler.tick()
             provision.assert_not_called()
         self.assertTrue(json.loads((self.scaler.state/'status.json').read_text())['draining'])
+
+    def test_failed_provision_cleans_slot_and_registration(self):
+        def boom(repo,slot,now,data):
+            data['runner_id']=77
+            self.scaler.record(slot,data)
+            raise RuntimeError('Per-job Docker daemon did not become ready')
+        with patch.object(self.scaler,'_provision',side_effect=boom):
+            with self.assertRaises(RuntimeError):
+                self.scaler.provision('aga-b/demo')
+        self.assertEqual(len(self.docker.removed),1)
+        self.assertIn(('DELETE','/repos/aga-b/demo/actions/runners/77',None),self.api.calls)
+        self.assertEqual(list((self.scaler.state/'provisioning').glob('*.json')),[])
+
+    def test_failed_provision_does_not_block_other_repos(self):
+        self.scaler.repos=[{'full_name':f'aga-b/r{i}','owner':{'login':'aga-b'},'id':i} for i in range(3)]
+        self.scaler.next_refresh=time.time()+300
+        self.api.pages=lambda *a,**k: iter([])
+        self.scaler.queue=lambda r: [{'id':1,'created_at':'2026-01-01T00:00:00Z'}]
+        calls=[]
+        def fake(repo):
+            calls.append(repo)
+            if repo=='aga-b/r1': raise RuntimeError('boom')
+            return 1.0
+        with patch.object(self.scaler,'provision',side_effect=fake):
+            self.scaler.tick()
+        self.assertEqual(sorted(calls),['aga-b/r0','aga-b/r1','aga-b/r2'])
+        self.assertGreater(self.scaler.cooldown['aga-b/r1'],time.time())
+        self.assertLess(self.scaler.cooldown['aga-b/r1'],time.time()+31)
+        status=json.loads((self.scaler.state/'status.json').read_text())
+        self.assertEqual(status['active'].get('aga-b/r0'),1)
+        self.assertEqual(status['metrics']['provisioned_this_tick'],3)
+        self.assertGreater(status['metrics']['oldest_queued_seconds'],0)
+
+    def test_provisioning_runs_in_parallel(self):
+        self.scaler.repos=[{'full_name':f'aga-b/r{i}','owner':{'login':'aga-b'},'id':i} for i in range(4)]
+        self.scaler.next_refresh=time.time()+300
+        self.api.pages=lambda *a,**k: iter([])
+        self.scaler.queue=lambda r: [{'id':1}]
+        def slow(repo):
+            time.sleep(0.3); return 0.3
+        begun=time.time()
+        with patch.object(self.scaler,'provision',side_effect=slow) as provision:
+            self.scaler.tick()
+        self.assertEqual(provision.call_count,4)
+        self.assertLess(time.time()-begun,0.9)
+
+    def test_memory_admission_limits_new_runners(self):
+        self.scaler.repos=[{'full_name':'aga-b/demo','owner':{'login':'aga-b'},'id':1}]
+        self.scaler.next_refresh=time.time()+300
+        self.api.pages=lambda *a,**k: iter([])
+        self.scaler.queue=lambda r: [{'id':1}]*4
+        self.scaler.min_free_mb=1000; self.scaler.job_reserve_mb=1000
+        with patch.object(self.scaler,'memory_available_mb',return_value=3500), \
+             patch.object(self.scaler,'provision') as provision:
+            self.scaler.tick()
+        self.assertEqual(provision.call_count,2)
+
+    def test_retire_is_deferred_not_blocking_tick(self):
+        slot=self.add(status='exited')
+        gate=__import__('threading').Event()
+        original=self.scaler.retire
+        def slow(*a,**k): gate.wait(2); return original(*a,**k)
+        with patch.object(self.scaler,'retire',side_effect=slow):
+            active,_=self.scaler.reconcile({'aga-b/demo':{}},background=True)
+            self.assertEqual(sum(active.values()),0)
+            self.assertEqual(self.docker.removed,[])
+            gate.set(); self.scaler.wait_retired()
+        self.assertIn(slot,self.docker.removed)
 
 
 if __name__=='__main__': unittest.main()

@@ -8,7 +8,8 @@ import signal
 import threading
 import time
 import uuid
-from collections import Counter
+from collections import Counter, deque
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 from docker_host import Docker, PREFIX
@@ -44,7 +45,15 @@ class Scaler:
             raise ValueError("POOL_NAME must be a short lowercase Docker-safe name")
         self.maximum = positive("MAX_RUNNERS", 2)
         self.per_repo = positive("MAX_RUNNERS_PER_REPO", self.maximum)
-        self.poll = positive("POLL_SECONDS", 30)
+        self.poll = positive("POLL_SECONDS", 10)
+        self.poll_idle = positive("POLL_IDLE_SECONDS", 20)
+        self.sweep = positive("SWEEP_SECONDS", 120)
+        self.parallelism = positive("PARALLELISM", 8)
+        self.min_free_mb = positive("MIN_FREE_MEMORY_MB", 4096)
+        self.job_reserve_mb = positive("JOB_MEMORY_RESERVE_MB", 3072)
+        self.mirror = os.environ.get("DOCKER_MIRROR", "").strip()
+        self.mirror_network = os.environ.get("DOCKER_MIRROR_NETWORK", "personal-ci-mirror").strip()
+        self.playwright_volume = os.environ.get("PLAYWRIGHT_CACHE_VOLUME", "personal-ci-playwright").strip()
         self.refresh = positive("REPO_REFRESH_SECONDS", 300)
         self.idle_timeout = positive("IDLE_TIMEOUT_SECONDS", 600)
         self.lifetime = positive("MAX_LIFETIME_SECONDS", 10800)
@@ -67,6 +76,14 @@ class Scaler:
         self.cooldown = {}
         self.errors = []
         self.busy = set()
+        self.executor = ThreadPoolExecutor(max_workers=self.parallelism, thread_name_prefix="ci")
+        self.retiring = {}
+        self.lock = threading.Lock()
+        self.next_sweep = 0
+        self.provision_times = deque(maxlen=50)
+        self.hot = False
+        self.metrics = {}
+        self.mem_total_mb = self.mem_used_mb = None
 
     def refresh_repositories(self):
         if time.time() < self.next_refresh:
@@ -96,10 +113,37 @@ class Scaler:
         write_json(self.state / "provisioning" / f"{slot}.json", data)
 
     def provision(self, repo):
-        now = int(time.time())
+        started = time.time()
+        now = int(started)
         slot = f"{self.pool}-{now}-{uuid.uuid4().hex[:8]}"
         data = {"repo": repo, "born": now, "runner_id": None, "slot": slot}
         self.record(slot, data)
+        try:
+            self._provision(repo, slot, now, data)
+        except BaseException:
+            # A half-built slot must not keep a repo's capacity reserved until the idle timeout.
+            self.cleanup_failed(repo, slot, data.get("runner_id"))
+            raise
+        elapsed = time.time() - started
+        with self.lock:
+            self.provision_times.append(elapsed)
+        LOG.info("Provisioned %s for %s in %.1fs", slot, repo, elapsed)
+        return elapsed
+
+    def cleanup_failed(self, repo, slot, runner_id):
+        try:
+            if runner_id:
+                try:
+                    self.api.request("DELETE", f"/repos/{repo}/actions/runners/{runner_id}")
+                except APIError as error:
+                    if error.status != 404:
+                        raise
+            self.docker.remove_slot(self.pool, slot)
+            (self.state / "provisioning" / f"{slot}.json").unlink(missing_ok=True)
+        except Exception as error:
+            LOG.warning("Cleanup of failed slot %s incomplete (%s); reconcile will retry", slot, type(error).__name__)
+
+    def _provision(self, repo, slot, now, data):
         labels = {"pool": self.pool, "slot": slot, "repo": repo, "born": str(now)}
         mounts = []
         for suffix, path in (("work", "/home/runner/_work"), ("externals", "/home/runner/externals"),
@@ -115,6 +159,11 @@ class Scaler:
                                       *self.docker.labels({**labels, "role": "init"}),
                                       *mounts, self.runner_image, "true")
         self.docker.call("rm", initializer)
+        daemon = ["dockerd", "--host=unix:///var/run/docker.sock",
+                  "--host=tcp://127.0.0.1:2375", "--tls=false"]
+        if self.mirror:
+            daemon += [f"--registry-mirror={self.mirror}",
+                       f"--insecure-registry={self.mirror.split('://', 1)[-1]}"]
         dind = self.docker.call("run", "-d", "--name", slot + "-docker", "--network", network,
                                "--privileged", "--memory", os.environ.get("DIND_MEMORY", "2g"),
                                "--memory-swap", os.environ.get("DIND_MEMORY", "2g"),
@@ -122,16 +171,18 @@ class Scaler:
                                "--log-opt", "max-size=10m", "--log-opt", "max-file=2",
                                "--env", "DOCKER_TLS_CERTDIR=", *mounts,
                                *self.docker.labels({**labels, "role": "dind"}),
-                               self.dind_image, "dockerd", "--host=unix:///var/run/docker.sock",
-                               "--host=tcp://127.0.0.1:2375", "--tls=false")
+                               self.dind_image, *daemon)
+        if self.mirror and self.mirror_network:
+            self.docker.call("network", "connect", self.mirror_network, dind)
+        deadline = time.time() + 40
         ready = False
-        for _ in range(30):
+        while time.time() < deadline:
             try:
-                self.docker.call("exec", dind, "docker", "info", timeout=5)
+                self.docker.call("exec", dind, "docker", "version", "--format", "{{.Server.Version}}", timeout=5)
                 ready = True
                 break
             except Exception:
-                time.sleep(1)
+                time.sleep(0.25)
         if not ready:
             raise RuntimeError("Per-job Docker daemon did not become ready")
         jit = self.api.request("POST", f"/repos/{repo}/actions/runners/generate-jitconfig",
@@ -139,6 +190,9 @@ class Scaler:
                                 "work_folder": "_work"})
         data["runner_id"] = jit["runner"]["id"]
         self.record(slot, data)
+        # Playwright locks and validates its browser cache, so concurrent jobs can share it safely.
+        shared = (["--mount", f"type=volume,source={self.playwright_volume},target=/home/runner/.cache/ms-playwright"]
+                  if self.playwright_volume else [])
         self.docker.call("run", "-d", "--name", slot, "--network", f"container:{dind}",
                          "--memory", os.environ.get("RUNNER_MEMORY", "4g"),
                          "--memory-swap", os.environ.get("RUNNER_MEMORY", "4g"),
@@ -146,10 +200,9 @@ class Scaler:
                          "--shm-size", "1g", "--init",
                          "--log-opt", "max-size=10m", "--log-opt", "max-file=2",
                          "--env", "RUNNER_JIT_CONFIG", "--env", "DOCKER_HOST=tcp://127.0.0.1:2375",
-                         "--env", "RUNNER_NAME=" + slot, *mounts,
+                         "--env", "RUNNER_NAME=" + slot, *mounts, *shared,
                          *self.docker.labels({**labels, "role": "runner", "runner-id": str(data["runner_id"])}),
                          self.runner_image, env={"RUNNER_JIT_CONFIG": jit["encoded_jit_config"]})
-        LOG.info("Provisioned %s for %s", slot, repo)
 
     def preserve_logs(self, container, slot, role):
         # Bounded console logs; GitHub job logs remain the primary CI logs.
@@ -162,8 +215,10 @@ class Scaler:
             self.docker.call("cp", f"{container}:/home/runner/_diag", str(self.state / "logs" / slot),
                              missing_ok=True, timeout=30)
 
-    def retire(self, slot, repo, runner_id=None):
-        for item in self.docker.objects("container", self.pool):
+    def retire(self, slot, repo, runner_id=None, containers=None):
+        if containers is None:
+            containers = self.docker.objects("container", self.pool)
+        for item in containers:
             labels = item["Config"]["Labels"]
             if labels.get(f"{PREFIX}.slot") == slot:
                 if item["State"]["Status"] == "running":
@@ -180,9 +235,24 @@ class Scaler:
         (self.state / "provisioning" / f"{slot}.json").unlink(missing_ok=True)
         LOG.info("Retired %s", slot)
 
-    def reconcile(self, registrations):
+    def retire_later(self, slot, repo, runner_id, containers):
+        def job():
+            try:
+                self.retire(slot, repo, runner_id, containers)
+            except Exception as error:
+                self.errors.append(f"Retire failed: {slot} ({type(error).__name__})")
+            finally:
+                self.retiring.pop(slot, None)
+        self.retiring[slot] = self.executor.submit(job)
+
+    def wait_retired(self, timeout=120):
+        for future in list(self.retiring.values()):
+            future.result(timeout=timeout)
+
+    def reconcile(self, registrations, containers=None, background=False):
         now = time.time()
-        containers = self.docker.objects("container", self.pool)
+        if containers is None:
+            containers = self.docker.objects("container", self.pool)
         runners = {item["Config"]["Labels"][f"{PREFIX}.slot"]: item for item in containers
                    if item["Config"]["Labels"].get(f"{PREFIX}.role") == "runner"}
         # Include Docker-only reservations when provisioning was interrupted.
@@ -216,9 +286,15 @@ class Scaler:
             known_idle = repo in registrations and not busy and slot not in self.busy
             expired = age > self.lifetime or (known_idle and age > self.idle_timeout)
             orphan = runner is None and age > self.idle_timeout
+            if slot in self.retiring:
+                local_names.discard(slot)
+                continue
             if finished or expired or orphan:
                 try:
-                    self.retire(slot, repo, data.get("runner_id"))
+                    if background:
+                        self.retire_later(slot, repo, data.get("runner_id"), containers)
+                    else:
+                        self.retire(slot, repo, data.get("runner_id"), containers)
                     self.busy.discard(slot)
                     local_names.discard(slot)
                     continue
@@ -257,7 +333,56 @@ class Scaler:
                         result.append(job)
         return result
 
+    UNITS = {"b": 1, "kb": 1e3, "kib": 1024, "mb": 1e6, "mib": 1024 ** 2, "gb": 1e9, "gib": 1024 ** 3}
+
+    def memory_available_mb(self):
+        """Host total minus live container usage; page cache is reclaimable and ignored."""
+        if self.mem_total_mb is None or self.mem_used_mb is None:
+            return None
+        return int(self.mem_total_mb - self.mem_used_mb)
+
+    def sample_memory(self):
+        total = int(self.docker.call("info", "--format", "{{.MemTotal}}"))
+        self.mem_total_mb = total // 1048576
+        output = self.docker.call("stats", "--no-stream", "--format", "{{.MemUsage}}", timeout=30)
+        used = 0.0
+        for line in output.splitlines():
+            match = re.match(r"\s*([\d.]+)\s*([A-Za-z]+)", line)
+            if match:
+                used += float(match[1]) * self.UNITS.get(match[2].lower(), 1)
+        self.mem_used_mb = used / 1048576
+
+    def start_memory_monitor(self, stop):
+        def loop():
+            while not stop.is_set():
+                try:
+                    self.sample_memory()
+                except Exception as error:
+                    self.mem_used_mb = None
+                    LOG.warning("Memory sampling failed (%s); admission control disabled", type(error).__name__)
+                stop.wait(10)
+        threading.Thread(target=loop, name="memory", daemon=True).start()
+
+    def memory_slots(self, idle_total):
+        """New runners the host can take; idle runners are reserved but not yet using memory."""
+        available = self.memory_available_mb()
+        if available is None:
+            return None
+        return max(0, (available - self.min_free_mb - idle_total * self.job_reserve_mb) // self.job_reserve_mb)
+
+    def fetch_parallel(self, function, items):
+        futures = {item: self.executor.submit(function, item) for item in items}
+        results = {}
+        for item, future in futures.items():
+            try:
+                results[item] = future.result()
+            except APIError as error:
+                self.errors.append(str(error))
+                self.cooldown[item if isinstance(item, str) else item["full_name"]] = time.time() + error.retry_after
+        return results
+
     def tick(self):
+        started = time.time()
         self.errors = []
         discovery_ok = True
         try:
@@ -266,49 +391,81 @@ class Scaler:
             # Local lifetime enforcement must continue during discovery outages.
             self.errors.append(str(error))
             discovery_ok = False
-        registrations = {}
-        # Include busy runners in repos that have since been excluded from discovery.
-        names = {repo["full_name"] for repo in self.repos}
+        containers = self.docker.objects("container", self.pool)
+        local = {item["Config"]["Labels"].get(f"{PREFIX}.repo") for item in containers}
         for file in (self.state / "provisioning").glob("*.json"):
-            names.add(json.loads(file.read_text())["repo"])
-        for name in names:
-            try:
-                registrations[name] = {r["name"]: r for r in self.api.pages(f"/repos/{name}/actions/runners", "runners", cached=True)}
-            except APIError as error:
-                self.errors.append(str(error))
-                self.cooldown[name] = time.time() + error.retry_after
-        active, idle = self.reconcile(registrations)
+            local.add(json.loads(file.read_text())["repo"])
+        # Runner lists are only needed where we own runners; sweep every repo occasionally
+        # so leaked JIT registrations are still cleaned up.
+        if started >= self.next_sweep:
+            names = {repo["full_name"] for repo in self.repos} | local
+            self.next_sweep = started + self.sweep
+        else:
+            names = {name for name in local if name}
+        names = {name for name in names if time.time() >= self.cooldown.get(name, 0)}
+        listed = self.fetch_parallel(
+            lambda name: {r["name"]: r for r in self.api.pages(f"/repos/{name}/actions/runners", "runners", cached=True)},
+            sorted(names))
+        registrations = {name: listed[name] for name in listed}
+        active, idle = self.reconcile(registrations, containers, background=True)
         queued = {}
-        for repo in self.repos if discovery_ok else []:
-            name = repo["full_name"]
-            if name not in registrations or time.time() < self.cooldown.get(name, 0):
-                continue
-            try:
-                queued[name] = len(self.queue(repo))
-            except APIError as error:
-                self.errors.append(str(error))
-                self.cooldown[name] = time.time() + error.retry_after
-        # Rotate repo order each polling round to avoid starving a fifth repo
-        # when four continuously busy repos free slots at the same time.
+        oldest = 0.0
+        if discovery_ok:
+            repos = [repo for repo in self.repos if time.time() >= self.cooldown.get(repo["full_name"], 0)]
+            jobs = {}
+            futures = {repo["full_name"]: self.executor.submit(self.queue, repo) for repo in repos}
+            for name, future in futures.items():
+                try:
+                    jobs[name] = future.result()
+                except APIError as error:
+                    self.errors.append(str(error))
+                    self.cooldown[name] = time.time() + error.retry_after
+            queued = {name: len(found) for name, found in jobs.items()}
+            created = [job.get("created_at") for found in jobs.values() for job in found if job.get("created_at")]
+            if created:
+                oldest = max(0.0, time.time() - min(time.mktime(time.strptime(c, "%Y-%m-%dT%H:%M:%SZ")) - time.timezone
+                                                     for c in created))
+        # Rotate repo order each polling round to avoid starving a repo
+        # when several continuously busy repos free slots at the same time.
         order = list(queued)
         if order:
             pivot = int(time.time() // self.poll) % len(order)
             queued = {repo: queued[repo] for repo in order[pivot:] + order[:pivot]}
         draining = (self.state / "drain").exists()
-        allocation = [] if draining else plan(queued, idle, active, self.maximum, self.per_repo)
+        headroom = self.memory_slots(sum(idle.values()))
+        maximum = self.maximum if headroom is None else min(self.maximum, sum(active.values()) + headroom)
+        allocation = [] if draining else plan(queued, idle, active, maximum, self.per_repo)
+        provision_started = time.time()
+        results = {}
         for repo in allocation:
-            try:
-                self.provision(repo)
-                active[repo] += 1
-            except Exception as error:
-                self.cooldown[repo] = time.time() + 120
-                self.errors.append(f"Provision failed for {repo} ({type(error).__name__})")
-                LOG.warning("Provision failed for %s; reserving partial slot until cleanup", repo)
-                # Never allocate another slot after a partial create without recounting.
-                break
+            results.setdefault(repo, []).append(self.executor.submit(self.provision, repo))
+        for repo, futures in results.items():
+            for future in futures:
+                try:
+                    future.result()
+                    active[repo] += 1
+                except Exception as error:
+                    detail = str(error) if isinstance(error, (APIError, RuntimeError)) else type(error).__name__
+                    self.cooldown[repo] = time.time() + 30
+                    self.errors.append(f"Provision failed for {repo} ({detail})")
+                    LOG.warning("Provision failed for %s (%s); slot cleaned up, retrying in 30s", repo, detail)
+        self.hot = bool(allocation) or sum(active.values()) > 0 or any(queued.values())
+        with self.lock:
+            times = list(self.provision_times)
+        self.metrics = {
+            "tick_seconds": round(time.time() - started, 2),
+            "provision_seconds_avg": round(sum(times) / len(times), 2) if times else None,
+            "provision_seconds_max": round(max(times), 2) if times else None,
+            "oldest_queued_seconds": round(oldest, 1),
+            "memory_available_mb": self.memory_available_mb(),
+            "admission_limit": maximum,
+            "provisioned_this_tick": len(allocation),
+            "provision_batch_seconds": round(time.time() - provision_started, 2) if allocation else 0,
+        }
         write_json(self.state / "status.json", {"updated_at": int(time.time()), "owner": self.owner,
                    "max_runners": self.maximum, "active": dict(active), "queued": queued,
-                   "idle": dict(idle), "draining": draining, "errors": self.errors})
+                   "idle": dict(idle), "draining": draining, "metrics": self.metrics,
+                   "errors": self.errors})
         cutoff = time.time() - positive("LOG_RETENTION_DAYS", 7) * 86400
         for path in (self.state / "logs").iterdir():
             if path.stat().st_mtime < cutoff:
@@ -328,8 +485,9 @@ def main():
     for sig in (signal.SIGTERM, signal.SIGINT):
         signal.signal(sig, lambda *_: stop.set())
     LOG.info("Controller started: owner=%s maximum=%d", scaler.owner, scaler.maximum)
+    scaler.start_memory_monitor(stop)
     while not stop.is_set():
-        wait = scaler.poll
+        wait = scaler.poll if scaler.hot else scaler.poll_idle
         try:
             scaler.tick()
         except Exception as error:
@@ -340,6 +498,7 @@ def main():
             write_json(scaler.state / "status.json", {"updated_at": int(time.time()), "errors": [message]})
         (scaler.state / "heartbeat").touch()
         stop.wait(wait)
+    scaler.wait_retired()
     LOG.info("Controller stopped; existing job containers continue running")
 
 
