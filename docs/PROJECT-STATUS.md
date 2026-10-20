@@ -12,7 +12,7 @@ hazırlanırken yeniden ölçülen sonuçlar VALIDATION.md dosyasında ayrı tut
 - Docker tabanlı `github-runner-autoscaler` kuruldu.
 - İzin verilen kişisel repoların otomatik keşfi ve izlenmesi yapılandırıldı.
 - `self-hosted,linux,x64,ci-linux` runner etiketleri kullanıldı.
-- Global paralellik mevcut host kapasitesine göre 2 olarak ayarlandı.
+- Global paralellik 20 (32 çekirdek / 64 GB host), bellek tabanlı kabul kontrolü ile.
 - Controller'ın iki geçici `agah-ci-*` runner açtığı ve tamamlanınca
   `retired` lifecycle mesajlarıyla temizlediği doğrulandı.
 - CI işlerinin self-hosted runner üzerinde tamamlanabildiği doğrulandı.
@@ -38,7 +38,7 @@ bir sonraki işte yeni image'dan açılmalıdır.
 1. Sunucuda bu repo güncellenir ve `./scripts/build.sh` çalıştırılır.
 2. `./scripts/preflight.sh` ile host, image ve disposable PostgreSQL testi geçirilir.
 3. Controller drain moduna alınır; aktif iş sıfırlandıktan sonra yeniden oluşturulur.
-4. `examples/runner-smoke.yml` dört shard ve en fazla iki eşzamanlı runner ile koşturulur.
+4. `examples/runner-smoke.yml` dört shard ve paralel eşzamanlı runner ile koşturulur.
 5. Yeni commit/run ile CI tekrar test edilir; eski run'ı rerun etmek yerine yeni
    image kullanan runner oluştuğu controller logundan teyit edilir.
 6. Repo tarafındaki zorunlu CI kontrollerinin sonuçları kaydedilir.
@@ -47,7 +47,7 @@ bir sonraki işte yeni image'dan açılmalıdır.
 
 ## Kabul kriterleri
 
-- Aynı anda en fazla iki runner aktiftir.
+- Aynı anda en fazla `MAX_RUNNERS` (20) runner aktiftir.
 - Her runner yalnızca bir job tamamlar ve ardından silinir.
 - Paralel PostgreSQL service container'ları port çakışması yaşamadan çalışır.
 - Runner içinde `apt-get`, `sudo`, `psql`, Docker CLI ve Compose v2 bulunur.

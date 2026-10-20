@@ -1,8 +1,10 @@
 """Small GitHub REST client. Credentials stay in the controller."""
 import base64
+import http.client
 import json
 import os
 import subprocess
+import threading
 import time
 import urllib.error
 import urllib.parse
@@ -32,6 +34,7 @@ class GitHub:
         self.token = ""
         self.token_until = 0
         self.cache = {}
+        self.auth_lock = threading.Lock()
 
     def jwt(self):
         now = int(time.time())
@@ -45,12 +48,13 @@ class GitHub:
     def auth(self):
         if self.pat_file:
             return Path(self.pat_file).read_text().strip()
-        if time.time() >= self.token_until:
-            value = self.request("POST", f"/app/installations/{self.installation_id}/access_tokens",
-                                 body={}, token=self.jwt())
-            self.token = value["token"]
-            self.token_until = time.time() + 3000
-        return self.token
+        with self.auth_lock:
+            if time.time() >= self.token_until:
+                value = self.request("POST", f"/app/installations/{self.installation_id}/access_tokens",
+                                     body={}, token=self.jwt())
+                self.token = value["token"]
+                self.token_until = time.time() + 3000
+            return self.token
 
     def request(self, method, path, body=None, token=None, cached=False):
         if not path.startswith("/") or path.startswith("//"):
@@ -82,7 +86,7 @@ class GitHub:
             if error.headers.get("X-RateLimit-Remaining") == "0":
                 retry = max(retry, int(error.headers.get("X-RateLimit-Reset", "0")) - int(time.time()) + 5)
             raise APIError(error.code, path, retry) from None
-        except (urllib.error.URLError, TimeoutError):
+        except (urllib.error.URLError, TimeoutError, http.client.HTTPException, OSError):
             # Hide connection details and preserve the same outage policy as HTTP errors.
             raise APIError(0, path) from None
 

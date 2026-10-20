@@ -16,5 +16,8 @@ else:
     print(f'Last update: {age}s ago (this may be stale if the controller is stopped)')
     print(f'Active: {sum(data.get("active", {}).values())} / {data.get("max_runners", "?")}')
     print(f'Queued: {sum(data.get("queued", {}).values())} | Draining: {data.get("draining", False)}')
+    m = data.get('metrics') or {}
+    if m:
+        print('Metrics:', ', '.join(f'{k}={v}' for k, v in m.items()))
     print(json.dumps(data, indent=2))
 PY

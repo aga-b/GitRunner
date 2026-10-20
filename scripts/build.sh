@@ -3,14 +3,25 @@ set -euo pipefail
 cd "$(dirname "${BASH_SOURCE[0]}")/.."
 [[ -f .env ]] || { echo 'Run scripts/prepare.sh first.'; exit 1; }
 runner_image="$(docker compose config --format json | python3 -c 'import json,sys; print(json.load(sys.stdin)["services"]["controller"]["environment"]["RUNNER_IMAGE"])')"
-# Resolve current official images at install/update time; keep immutable digests.
-docker pull ghcr.io/actions/actions-runner:latest
-docker pull docker:dind
-runner_base="$(docker image inspect ghcr.io/actions/actions-runner:latest --format '{{index .RepoDigests 0}}')"
-dind_image="$(docker image inspect docker:dind --format '{{index .RepoDigests 0}}')"
+# Default: rebuild from the digests pinned in .env. `--update` resolves newer official
+# images (weekly refresh); the previous digests are kept in .env.previous for rollback.
+current() { grep -E "^$1=" .env | head -1 | cut -d= -f2-; }
+if [[ "${1:-}" == "--update" || -z "$(current RUNNER_BASE)" || -z "$(current DIND_IMAGE)" ]]; then
+  cp -p .env .env.previous
+  docker pull ghcr.io/actions/actions-runner:latest
+  docker pull docker:dind
+  runner_base="$(docker image inspect ghcr.io/actions/actions-runner:latest --format '{{index .RepoDigests 0}}')"
+  dind_image="$(docker image inspect docker:dind --format '{{index .RepoDigests 0}}')"
+else
+  runner_base="$(current RUNNER_BASE)"
+  dind_image="$(current DIND_IMAGE)"
+  docker pull "$runner_base" >/dev/null
+  docker pull "$dind_image" >/dev/null
+fi
 [[ "$runner_base" == *@sha256:* && "$dind_image" == *@sha256:* ]]
-docker build --pull --build-arg "RUNNER_BASE=$runner_base" -f runner/Dockerfile -t "$runner_image" .
-docker compose build --pull controller
+DOCKER_BUILDKIT=1 docker build --build-arg "RUNNER_BASE=$runner_base" -f runner/Dockerfile -t "$runner_image" .
+docker compose pull mirror
+docker compose build controller
 # Update only these keys. Never source .env as executable shell code.
 python3 - "$runner_base" "$dind_image" <<'PY'
 import sys

@@ -42,14 +42,13 @@ Mevcut host profili:
 | Host CPU | 4 vCPU, Intel i7-9700 |
 | Host RAM | 15 GiB |
 | Host disk | 118 GB |
-| `MAX_RUNNERS` | 2 |
-| `MAX_RUNNERS_PER_REPO` | 4 |
-| Runner limiti | 2 CPU / 4 GiB |
-| DinD limiti | 1 CPU / 2 GiB |
+| `MAX_RUNNERS` | 20 |
+| `MAX_RUNNERS_PER_REPO` | 12 |
+| Runner limiti | 8 CPU / 8 GiB |
+| DinD limiti | 4 CPU / 4 GiB |
 | Repo yenileme | 300 saniye |
 
-`MAX_RUNNERS_PER_REPO=4` gelecekteki daha büyük hostlar için tavanı tanımlar;
-mevcut durumda global 2 limiti her zaman önce uygulanır.
+Global limit bellek tabanlı kabul kontrolüyle birlikte uygulanır: boş bellek (host toplamı eksi çalışan container kullanımı) `MIN_FREE_MEMORY_MB` ve `JOB_MEMORY_RESERVE_MB` ile sınırlanır.
 
 ## Job izolasyonu
 

@@ -32,11 +32,9 @@ class Docker:
         return [part for key, value in labels.items() for part in ("--label", f"{PREFIX}.{key}={value}")]
 
     def remove_slot(self, pool, slot):
-        containers = self.objects("container", pool)
-        for item in sorted(containers, key=lambda c: c["Config"]["Labels"].get(f"{PREFIX}.role") == "dind"):
-            if item["Config"]["Labels"].get(f"{PREFIX}.slot") == slot:
-                self.call("rm", "-fv", item["Id"])
-        for kind in ("volume", "network"):
-            for item in self.objects(kind, pool):
-                if (item.get("Labels") or {}).get(f"{PREFIX}.slot") == slot:
-                    self.call(kind, "rm", item["Name"])
+        # The runner shares the daemon's network namespace, so it is removed first.
+        for name in (slot, slot + "-init", slot + "-docker"):
+            self.call("rm", "-fv", name, missing_ok=True)
+        for suffix in ("work", "externals", "tools"):
+            self.call("volume", "rm", "-f", f"{slot}-{suffix}", missing_ok=True)
+        self.call("network", "rm", f"{slot}-net", missing_ok=True)

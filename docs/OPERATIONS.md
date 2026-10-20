@@ -82,3 +82,10 @@ job'unun kesileceği kabul edilerek yapılmalıdır.
 - Runner console logları en fazla 7 gün saklanır.
 - Dashboard token'ı yalnızca secret/env ile verilir.
 - Debug için shell tracing (`set -x`) JIT config veya token içeren adımlarda açılmaz.
+
+## Bakım ve performans
+
+- `scripts/maintenance.sh` haftalık çalışır (cron): kullanılmayan imajları ve eski logları temizler.
+- Docker Hub çekimleri `personal-ci-mirror` (registry:2 pull-through) üzerinden geçer; önbellek `personal-ci-mirror-data` volume'unda tutulur.
+- `scripts/build.sh --update` imaj digest'lerini günceller; önceki değerler `.env.previous` dosyasına yedeklenir.
+- `scripts/status.sh` tick süresi, provision süresi, en eski kuyruk bekleme ve admission limitini gösterir.

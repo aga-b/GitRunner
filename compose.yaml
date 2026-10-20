@@ -15,9 +15,11 @@ services:
       - /var/run/docker.sock:/var/run/docker.sock
       - ./secrets:/run/secrets:ro
       - ./state:/state
-    mem_limit: 256m
-    cpus: 0.5
-    pids_limit: 128
+    depends_on:
+      - mirror
+    mem_limit: 512m
+    cpus: 1
+    pids_limit: 256
     read_only: true
     tmpfs:
       - /tmp:size=32m
@@ -32,3 +34,30 @@ services:
       timeout: 5s
       start_period: 180s
       retries: 5
+  # Pull-through Docker Hub cache shared by every per-job Docker daemon.
+  mirror:
+    image: registry:2
+    container_name: personal-ci-mirror
+    restart: unless-stopped
+    environment:
+      REGISTRY_PROXY_REMOTEURL: https://registry-1.docker.io
+      REGISTRY_PROXY_TTL: 168h
+      REGISTRY_STORAGE_DELETE_ENABLED: 'true'
+    volumes:
+      - mirror-data:/var/lib/registry
+    networks:
+      - mirror
+    mem_limit: 512m
+    cpus: 1
+    pids_limit: 256
+    logging:
+      driver: json-file
+      options:
+        max-size: 10m
+        max-file: '2'
+networks:
+  mirror:
+    name: personal-ci-mirror
+volumes:
+  mirror-data:
+    name: personal-ci-mirror-data

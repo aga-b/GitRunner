@@ -28,9 +28,14 @@ def memory(value):
     if value.endswith('g'): return float(value[:-1])*1024**3
     if value.endswith('m'): return float(value[:-1])*1024**2
     return float(value)
-required = maximum*(memory(os.environ.get('RUNNER_MEMORY','4g')) + memory(os.environ.get('DIND_MEMORY','2g'))) + 2*1024**3
-if info['MemTotal'] < required:
-    raise SystemExit(f'Host RAM is too small for configured limits: need at least {required/1024**3:.1f} GiB; lower MAX_RUNNERS or memory limits')
+per_job = memory(os.environ.get('RUNNER_MEMORY','4g')) + memory(os.environ.get('DIND_MEMORY','2g'))
+floor = positive('MIN_FREE_MEMORY_MB', 4096)*1024**2
+if info['MemTotal'] < per_job + floor:
+    raise SystemExit(f'Host RAM is too small for one job: need at least {(per_job+floor)/1024**3:.1f} GiB; lower RUNNER_MEMORY/DIND_MEMORY')
+worst = maximum*per_job + floor
+if info['MemTotal'] < worst:
+    print(f'NOTE: worst-case limits ({worst/1024**3:.0f} GiB) exceed host RAM ({info["MemTotal"]/1024**3:.0f} GiB); '
+          'memory admission (MIN_FREE_MEMORY_MB / JOB_MEMORY_RESERVE_MB) keeps new jobs from starting when RAM is short.')
 print('Images and host capacity OK; running disposable Docker/service smoke test next.')
 from smoke import main
 main()
