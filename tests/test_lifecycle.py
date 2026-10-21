@@ -233,5 +233,29 @@ class LifecycleTests(unittest.TestCase):
             gate.set(); self.scaler.wait_retired()
         self.assertIn(slot,self.docker.removed)
 
+    def test_pending_workflow_run_with_queued_matching_job_is_admitted(self):
+        repo={'full_name':'aga-b/demo','owner':{'login':'aga-b'},'id':1}
+        run={'id':123,'actor':{'login':'aga-b'},'event':'push'}
+        job={'id':456,'status':'queued','labels':['self-hosted','linux','x64','ci-linux']}
+        queried=[]
+        def pages(path,key=None,cached=False):
+            queried.append(path)
+            if path.endswith('/actions/runners'):
+                return iter([])
+            if path.endswith('/actions/runs?status=pending'):
+                return iter([run])
+            if path.endswith('/actions/runs/123/jobs?filter=latest'):
+                return iter([job])
+            return iter([])
+        self.api.pages=pages
+        self.scaler.repos=[repo]
+        self.scaler.next_refresh=time.time()+300
+        with patch.object(self.scaler,'provision') as provision:
+            self.scaler.tick()
+        provision.assert_called_once_with('aga-b/demo')
+        self.assertIn('/repos/aga-b/demo/actions/runs?status=pending',queried)
+        status=json.loads((self.scaler.state/'status.json').read_text())
+        self.assertEqual(status['queued']['aga-b/demo'],1)
+
 
 if __name__=='__main__': unittest.main()
