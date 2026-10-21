@@ -320,7 +320,9 @@ class Scaler:
     def queue(self, repo):
         result = []
         seen = set()
-        for status in ("queued", "in_progress"):
+        # A workflow can be `pending` while its matching job is already queued,
+        # including when it is waiting for a self-hosted runner to come online.
+        for status in ("queued", "pending", "in_progress"):
             runs = self.api.pages(f"/repos/{repo['full_name']}/actions/runs?status={status}",
                                   "workflow_runs", cached=True)
             for run in runs:
